@@ -1,0 +1,8 @@
+---
+# Restart one node at a time so quorum is never lost
+- name: Restart etcd
+  ansible.builtin.systemd_service:
+    name: etcd
+    state: restarted
+    daemon_reload: true
+  throttle: 1

@@ -1,0 +1,13 @@
+---
+# Master-worker reload: the master re-execs itself, picking up a new binary without dropping existing connections
+- name: Reload haproxy
+  ansible.builtin.systemd_service:
+    name: haproxy
+    state: reloaded
+
+- name: Restart haproxy
+  ansible.builtin.systemd_service:
+    name: haproxy
+    state: restarted
+    daemon_reload: true
+  throttle: 1

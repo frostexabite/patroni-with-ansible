@@ -1,0 +1,3 @@
+---
+# First node gets 150, then 140, 130 ... (can be overridden in the inventory)
+keepalived_priority: "{{ 150 - (groups['pg_cluster'].index(inventory_hostname) * 10) }}"

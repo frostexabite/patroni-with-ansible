@@ -1,0 +1,36 @@
+---
+# PostgreSQL from the OS AppStream — remove the PGDG repo (if present)
+# so dnf never switches to PGDG packages during updates
+- name: Remove PGDG repository package if present
+  ansible.builtin.dnf:
+    name: pgdg-redhat-repo
+    state: absent
+
+# EL8/EL9: PostgreSQL comes in module streams (postgresql:13, :15, :16, ...) — enable the wanted stream first
+- name: Enable the AppStream module stream (EL8/EL9) for PostgreSQL {{ pg_version }}
+  when: el_major | int < 10
+  block:
+    - name: Read postgresql module streams
+      ansible.builtin.command: dnf -q module list postgresql
+      register: postgresql_modules
+      changed_when: false
+      check_mode: false
+
+    - name: Require an AppStream module stream for PostgreSQL {{ pg_version }}
+      ansible.builtin.assert:
+        that: postgresql_modules.stdout is search('(?m)^postgresql\\s+' ~ pg_version ~ '(\\s|$)')
+        fail_msg: >-
+          AppStream on EL{{ el_major }} has no postgresql:{{ pg_version }} module stream.
+          Use pg_install_source: pgdg (or auto), or a pg_version listed by `dnf module list postgresql`.
+        quiet: true
+
+    # [e] = enabled; coming from pgdg mode (module disabled) or another enabled stream requires a reset first
+    - name: Reset the postgresql module (switching from another stream or from pgdg mode)
+      ansible.builtin.command: dnf -qy module reset postgresql
+      when: postgresql_modules.stdout is not search('(?m)^postgresql\\s+' ~ pg_version ~ '\\s+(\\[[a-z]\\])*\\[e\\]')
+      changed_when: true
+
+    - name: Enable postgresql:{{ pg_version }}
+      ansible.builtin.command: "dnf -qy module enable postgresql:{{ pg_version }}"
+      when: postgresql_modules.stdout is not search('(?m)^postgresql\\s+' ~ pg_version ~ '\\s+(\\[[a-z]\\])*\\[e\\]')
+      changed_when: true

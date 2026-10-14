@@ -1,0 +1,41 @@
+---
+# =====================================================================
+#  PostgreSQL HA cluster: etcd + Patroni + HAProxy + keepalived
+#  on Rocky Linux / RHEL 8, 9, 10
+#
+#    python3 scripts/setup-inventory.py                           # enter IPs / VIP / subnet (first time)
+#    ansible-playbook site.yml --ask-vault-pass                   # install / update everything
+#    ansible-playbook site.yml --ask-vault-pass --check --diff    # show what would change (dry run)
+#    ansible-playbook site.yml --ask-vault-pass --tags haproxy    # selected roles only
+#    ansible-playbook site.yml --ask-vault-pass --skip-tags preflight
+#
+#  Order: validate inventory → detect OS → preflight → common → postgresql → etcd
+#         → patroni → haproxy → keepalived → verify
+#  (detect OS always runs, even with --tags / --skip-tags preflight, because it selects the system Python)
+# =====================================================================
+- name: Pre-flight checks
+  ansible.builtin.import_playbook: playbooks/preflight.yml
+
+- name: Deploy PostgreSQL HA cluster (Patroni / etcd / HAProxy / keepalived)
+  hosts: pg_cluster
+  gather_facts: true
+  any_errors_fatal: true
+
+  roles:
+    - role: common
+      tags: [common]
+    - role: postgresql
+      tags: [postgresql]
+    - role: etcd
+      tags: [etcd]
+    - role: patroni
+      tags: [patroni]
+    - role: haproxy
+      tags: [haproxy]
+    - role: keepalived
+      tags: [keepalived]
+      when: keepalived_on | bool
+
+- name: Verify cluster
+  ansible.builtin.import_playbook: playbooks/verify.yml
+  tags: [verify]

@@ -1,0 +1,13 @@
+---
+# Version from the OS AppStream (EL8 = 2.1, EL9/EL10 = 2.2 — all support vrrp_track_process)
+- name: Install keepalived from AppStream
+  ansible.builtin.dnf:
+    name: keepalived
+    state: "{{ package_state }}"
+  notify: Restart keepalived
+
+- name: Remove unit override left by a previous source install
+  ansible.builtin.file:
+    path: /etc/systemd/system/keepalived.service
+    state: absent
+  notify: Restart keepalived

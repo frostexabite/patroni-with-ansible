@@ -1,0 +1,9 @@
+---
+# SIGHUP — Patroni re-reads patroni.yml (rewrites pg_hba / reloads PostgreSQL) without a restart.
+# Only on nodes where Patroni was already running before this play — otherwise the start task picks up the new config
+# (state: reloaded on a stopped service would start it, skipping the bootstrap order)
+- name: Reload patroni
+  ansible.builtin.systemd_service:
+    name: patroni
+    state: reloaded
+  when: patroni_was_active | default(false) | bool

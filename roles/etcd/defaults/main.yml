@@ -1,0 +1,4 @@
+---
+etcd_endpoints: >-
+  {{ groups['pg_cluster'] | map('extract', hostvars, 'node_ip')
+     | map('regex_replace', '^', 'http://') | map('regex_replace', '$', ':' ~ etcd_client_port) | join(',') }}

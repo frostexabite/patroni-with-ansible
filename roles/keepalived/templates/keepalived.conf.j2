@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+global_defs {
+    router_id {{ inventory_hostname }}
+}
+
+# Track the haproxy process directly (no script/killall needed)
+# weight 0 = if haproxy dies the instance goes to FAULT and releases the VIP immediately
+# (the original guide used weight 2, so the VIP never moved: 150 is still greater than 140+2)
+vrrp_track_process track_haproxy {
+    process haproxy
+    weight 0
+    delay 2
+}
+
+vrrp_instance VI_PG {
+    state {{ 'MASTER' if inventory_hostname == groups['pg_cluster'][0] else 'BACKUP' }}
+    interface {{ keepalived_iface }}
+    virtual_router_id {{ keepalived_vrid }}
+    priority {{ keepalived_priority }}
+    advert_int 1
+{% if keepalived_unicast | bool %}
+    unicast_src_ip {{ node_ip }}
+    unicast_peer {
+{% for h in groups['pg_cluster'] if h != inventory_hostname %}
+        {{ hostvars[h]['node_ip'] }}
+{% endfor %}
+    }
+{% endif %}
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_auth_pass }}
+    }
+    virtual_ipaddress {
+        {{ keepalived_vip }}/{{ keepalived_vip_prefix }} dev {{ keepalived_iface }}
+    }
+    track_process {
+        track_haproxy
+    }
+}

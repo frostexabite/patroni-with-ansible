@@ -1,0 +1,201 @@
+---
+# =====================================================================
+#  PostgreSQL HA (Patroni + etcd + HAProxy + keepalived)
+#  Rocky Linux / RHEL 8, 9, 10 (AlmaLinux / Oracle Linux of the same family work too)
+#  Cluster defaults and tuning
+#  Site values (IPs, subnets, VIP) live in inventory/hosts.yml — no need to edit this file
+#    Enter them interactively with: python3 scripts/setup-inventory.py
+#
+#  All versions are the latest stable releases as of 2026-10-12
+#    PostgreSQL 18.6 (PGDG or AppStream) | 19 is still in beta
+#    etcd 3.7.2 | Patroni 4.1.5 | psycopg 3.3.6
+#    HAProxy 3.4.6 (LTS) | keepalived 2.4.3        | built from source
+#  To upgrade: change the *_version variables below and re-run the playbook
+# =====================================================================
+
+# ---------- Network ----------
+# cluster_network_cidr / app_allowed_cidrs / keepalived_vip → inventory/hosts.yml
+node_ip: "{{ ansible_host | default(inventory_hostname) }}"   # IP used for traffic inside the cluster
+manage_etc_hosts: true
+set_hostname: true
+
+# ---------- OS ----------
+# Supported IDs from /etc/os-release (rocky = Rocky Linux, rhel = Red Hat Enterprise Linux)
+os_supported_ids: [rocky, rhel, almalinux, ol]
+os_supported_major_versions: ["8", "9", "10"]
+allow_unsupported_os: false                   # true = skip the OS check (e.g. CentOS Stream); settings follow the major version
+allow_mixed_os_versions: false                # true = allow nodes on different major versions (not recommended: glibc/collations differ)
+el_major: "{{ ansible_facts['distribution_major_version'] | string }}"
+
+# System Python that has the dnf / SELinux / firewalld bindings — Ansible must use this one.
+# playbooks/detect_os.yml sets ansible_python_interpreter from it (unless you set it in the inventory)
+os_system_python:
+  "8": /usr/libexec/platform-python           # Python 3.6 → the control node must use ansible-core 2.16
+  "9": /usr/bin/python3                       # Python 3.9
+  "10": /usr/bin/python3                      # Python 3.12
+os_system_python_setuptools:
+  "8": platform-python-setuptools
+  "9": python3-setuptools
+  "10": python3-setuptools
+
+selinux_state: permissive                     # enforcing | permissive (the original guide used setenforce 0)
+firewall_enabled: true                        # run firewalld and open only the required ports
+firewall_remove_stale_rules: true             # remove cluster-port rich rules from old subnets (e.g. after a CIDR change)
+package_state: latest                         # latest = dnf always installs/updates to the newest version
+os_update_all: true                           # dnf upgrade every OS package (never reboots — warns when a reboot is needed)
+build_src_dir: /usr/local/src                 # where HAProxy/keepalived sources are built
+
+# ---------- PostgreSQL ----------
+pg_version: 18                                # latest GA major (latest minor follows package_state)
+pg_data_dir: "/var/lib/pgsql/{{ pg_version }}/data"
+# Package source:
+#   auto      = EL10 → appstream (the OS postgresql18) | EL8/EL9 → pgdg (EL8/9 AppStream lacks it or not on every minor)
+#   pgdg      = PostgreSQL.org repo on every version (binaries in /usr/pgsql-<ver>/bin)
+#   appstream = OS packages (binaries in /usr/bin) — EL8/9 use module stream postgresql:<ver>
+# Never switch the source on a running cluster (bin_dir changes)
+pg_install_source: auto
+pg_install_source_effective: >-
+  {{ pg_install_source if pg_install_source != 'auto'
+     else ('appstream' if (el_major | int) >= 10 else 'pgdg') }}
+pg_bin_dir: "{{ '/usr/bin' if pg_install_source_effective == 'appstream' else '/usr/pgsql-' ~ pg_version ~ '/bin' }}"
+# Package names: pgdg = postgresql18-* | EL10 AppStream = postgresql18-* (except the OS default version)
+#                EL8/9 AppStream = postgresql-* (version chosen by the module stream)
+pg_appstream_el10_default_version: 16         # the version EL10 ships under the plain "postgresql" name
+pg_pkg_prefix: >-
+  {{ ('postgresql' ~ pg_version)
+     if (pg_install_source_effective == 'pgdg'
+         or ((el_major | int) >= 10 and (pg_version | int) != (pg_appstream_el10_default_version | int)))
+     else 'postgresql' }}
+pg_packages:
+  - "{{ pg_pkg_prefix }}"
+  - "{{ pg_pkg_prefix }}-server"
+  - "{{ pg_pkg_prefix }}-contrib"
+pg_port: 5432
+pg_superuser: postgres
+pg_superuser_password: "{{ vault_pg_superuser_password }}"
+pg_replication_user: replicator
+pg_replication_password: "{{ vault_pg_replication_password }}"
+pg_rewind_user: rewind_user
+pg_rewind_password: "{{ vault_pg_rewind_password }}"
+pgdg_repo_base: https://download.postgresql.org/pub/repos/yum/reporpms
+pgdg_repo_el: "EL-{{ el_major }}-{{ ansible_facts['architecture'] }}"
+pgdg_repo_rpm_url: "{{ pgdg_repo_base }}/{{ pgdg_repo_el }}/pgdg-redhat-repo-latest.noarch.rpm"
+pgdg_gpg_key_base: https://download.postgresql.org/pub/repos/yum/keys
+pgdg_gpg_key_urls: >-
+  {{ [pgdg_gpg_key_base ~ '/PGDG-RPM-GPG-KEY-RHEL']
+     + ([pgdg_gpg_key_base ~ '/PGDG-RPM-GPG-KEY-AARCH64-RHEL'] if ansible_facts['architecture'] == 'aarch64' else []) }}
+pgdg_repo_priority: 1                         # PGDG wins over same-name AppStream packages (EL10 has postgresql18 in both)
+# EL10: dnf has no $releasever_minor on Rocky/Oracle → the PGDG URL becomes "rhel-10.-x86_64" (404),
+# so it is replaced with rhel-<major>-$basearch | EL8/9 keep $releasever (works with RHEL minor/EUS locks)
+pgdg_pin_major_baseurl: "{{ (el_major | int) >= 10 }}"
+
+# Parameters stored in the DCS (used only at the first bootstrap;
+# change them afterwards with `patronictl edit-config`)
+pg_dcs_parameters:
+  wal_level: replica
+  hot_standby: "on"
+  max_connections: 200
+  max_wal_senders: 10
+  max_replication_slots: 10
+  wal_keep_size: 128MB
+  wal_log_hints: "on"
+  password_encryption: scram-sha-256
+
+# Per-node local parameters (change, then run --tags patroni → Patroni reloads;
+# ones that need a restart, such as logging_collector, show "Pending restart" in `pctl list -e`)
+pg_local_parameters:
+  unix_socket_directories: /run/postgresql
+  logging_collector: "on"                     # logs go to <data_dir>/log/
+  log_directory: log
+  log_filename: postgresql-%a.log
+  log_truncate_on_rotation: "on"
+  log_rotation_age: 1d
+  log_rotation_size: "0"
+  log_line_prefix: "%m [%p] %q%u@%d "
+
+# ---------- etcd ----------
+etcd_version: v3.7.2                          # an existing cluster must be on >= v3.6.11 before moving to 3.7
+etcd_client_port: 2379
+etcd_peer_port: 2380
+etcd_cluster_token: patroni-etcd-cluster
+etcd_data_dir: /var/lib/etcd
+# Air-gapped: put the tarball on the control node and set its path (no GitHub download)
+etcd_tarball_local_path: ""
+
+# ---------- Patroni ----------
+cluster_scope: postgres-cluster
+cluster_namespace: /db/
+patroni_version: 4.1.5
+psycopg_version: 3.3.6                        # requires Python >= 3.10
+# Python for the Patroni venv, per EL major version
+#   EL8 (3.6) / EL9 (3.9) are too old for psycopg 3.3 → use python3.12 from AppStream (EL 8.10 / 9.4 or newer)
+#   On RHEL 9.2–9.3 (no python3.12 yet) switch to python3.11 / python3.11-pip / /usr/bin/python3.11
+patroni_python_by_major:
+  "8": { packages: [python3.12, python3.12-pip], bin: /usr/bin/python3.12 }
+  "9": { packages: [python3.12, python3.12-pip], bin: /usr/bin/python3.12 }
+  "10": { packages: [python3, python3-pip], bin: /usr/bin/python3 }
+patroni_python_default: { packages: [python3, python3-pip], bin: /usr/bin/python3 }
+patroni_python_packages: "{{ (patroni_python_by_major[el_major] | default(patroni_python_default)).packages }}"
+patroni_python: "{{ (patroni_python_by_major[el_major] | default(patroni_python_default)).bin }}"
+patroni_venv: /opt/patroni
+patroni_config_dir: /etc/patroni
+patroni_config_file: "{{ patroni_config_dir }}/patroni.yml"
+patroni_restapi_port: 8008
+patroni_restapi_username: patroni
+patroni_restapi_password: "{{ vault_patroni_restapi_password }}"
+patroni_bootstrap_node: "{{ groups['pg_cluster'][0] }}"
+patroni_pip_extra_args: ""                    # e.g. "--index-url https://pypi.internal/simple"
+patroni_dcs:
+  ttl: 30
+  loop_wait: 10
+  retry_timeout: 10
+  maximum_lag_on_failover: 1048576
+patroni_replica_wait_retries: 120             # x 10s to wait for replica clones (raise for large databases)
+patroni_bootstrap_wait_retries: 60            # x 5s to wait for the first Leader to bootstrap
+
+# ---------- HAProxy ----------
+haproxy_install_method: source                # source = build the latest from haproxy.org | package = AppStream (EL9+ only)
+haproxy_version: 3.4.6
+haproxy_branch: "{{ haproxy_version.split('.')[:2] | join('.') }}"
+haproxy_download_url: "https://www.haproxy.org/download/{{ haproxy_branch }}/src/haproxy-{{ haproxy_version }}.tar.gz"
+haproxy_make_options: "TARGET=linux-glibc USE_OPENSSL=1 USE_PCRE2=1 USE_PCRE2_JIT=1 USE_PROMEX=1"
+haproxy_bin: "{{ '/usr/local/sbin/haproxy' if haproxy_install_method == 'source' else '/usr/sbin/haproxy' }}"
+haproxy_write_port: 5000
+haproxy_read_port: 5001
+haproxy_stats_port: 7000
+haproxy_maxconn: 1000
+haproxy_backend_maxconn: 100
+haproxy_read_check_uri: /replica              # or /read-only (includes the primary)
+haproxy_stats_user: admin
+haproxy_stats_password: "{{ vault_haproxy_stats_password }}"
+
+# ---------- keepalived (VIP) ----------
+# keepalived_enabled / keepalived_vip / keepalived_vip_prefix / keepalived_router_id / keepalived_interface
+#   → inventory/hosts.yml (never define them here too — group_vars/all takes precedence over group vars in hosts.yml)
+keepalived_install_method: source             # source = build from the latest Git tag | package = AppStream
+keepalived_version: 2.4.3
+keepalived_git_repo: https://github.com/acassen/keepalived.git
+keepalived_git_commit: 53701f5648fb457fce5c3417fd309f286fbd1335   # commit of tag v2.4.3 (verifies the source)
+keepalived_configure_options: "--prefix=/usr/local --sysconfdir=/etc --disable-lvs"
+keepalived_bin: "{{ '/usr/local/sbin/keepalived' if keepalived_install_method == 'source' else '/usr/sbin/keepalived' }}"
+# Effective (internal) values — taken from hosts.yml when set, otherwise defaults
+keepalived_on: "{{ keepalived_enabled | default(true) | bool }}"
+keepalived_vrid: "{{ keepalived_router_id | default(51) }}"   # must be unique among VRRP groups on the same L2
+# Interface: without keepalived_interface in hosts.yml, use the interface that holds node_ip
+# (not found → the default-route interface)
+keepalived_iface: "{{ keepalived_interface | default(keepalived_interface_auto, true) }}"
+keepalived_interface_auto: >-
+  {%- set ns = namespace(dev=(ansible_facts['default_ipv4'] | default({})).get('interface', '')) -%}
+  {%- for i in ansible_facts['interfaces'] | default([]) -%}
+  {%- set f = ansible_facts[i | replace('-', '_')] | default({}) -%}
+  {%- set addrs = [(f.get('ipv4') or {}).get('address', '')] + ((f.get('ipv4_secondaries') or []) | map(attribute='address') | list) -%}
+  {%- if node_ip in addrs -%}{%- set ns.dev = f.get('device', i) -%}{%- endif -%}
+  {%- endfor -%}
+  {{ ns.dev }}
+keepalived_unicast: true                      # unicast VRRP (for VMs/clouds that block multicast)
+keepalived_auth_pass: "{{ vault_keepalived_auth_pass }}"   # 8 characters max
+
+# ---------- Pre-flight (playbooks/preflight.yml) ----------
+preflight_check_internet: true                # check that nodes can reach the required download sources
+preflight_check_vip_free: true                # check nobody else uses the VIP (only while it is not on the cluster yet)
+preflight_check_repos: true                   # check the OS repos provide required packages (python3.12, AppStream postgresql)

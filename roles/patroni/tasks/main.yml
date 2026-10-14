@@ -1,0 +1,191 @@
+---
+# Install Patroni into a virtualenv (never pip install into the system Python)
+# psycopg 3.3 needs Python >= 3.10 → EL8/EL9 use python3.12 from AppStream, EL10 uses python3 (3.12)
+- name: Install Python for the Patroni virtualenv ({{ patroni_python }})
+  ansible.builtin.dnf:
+    name: "{{ patroni_python_packages }}"
+    state: "{{ package_state }}"
+
+- name: Check the Python version used for the Patroni virtualenv
+  ansible.builtin.command: "{{ patroni_python }} -c 'import sys; print(\"%d.%d\" % sys.version_info[:2])'"
+  register: patroni_python_version
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Require Python >= 3.10 for Patroni / psycopg {{ psycopg_version }}
+  ansible.builtin.assert:
+    that: patroni_python_version.rc == 0 and (patroni_python_version.stdout | trim) is version('3.10', '>=')
+    fail_msg: >-
+      {{ patroni_python }} is "{{ patroni_python_version.stdout | default('') | trim }}{{ patroni_python_version.stderr | default('') | trim }}";
+      psycopg {{ psycopg_version }} needs Python >= 3.10. Adjust patroni_python_by_major in inventory/group_vars/all/main.yml.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Check whether Patroni is already running
+  ansible.builtin.systemd_service:
+    name: patroni
+  register: patroni_state
+  failed_when: false
+
+- name: Remember whether Patroni was running before this play
+  ansible.builtin.set_fact:
+    patroni_was_active: "{{ (patroni_state.status | default({})).ActiveState | default('') == 'active' }}"
+
+# A venv built with a different Python (e.g. moving from python3.11 to 3.12) must be rebuilt
+- name: Read the Python version of the existing virtualenv
+  ansible.builtin.command: "{{ patroni_venv }}/bin/python -c 'import sys; print(\"%d.%d\" % sys.version_info[:2])'"
+  register: patroni_venv_version
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Rebuild a virtualenv that was built with a different Python
+  when:
+    - patroni_venv_version.rc == 0
+    - patroni_python_version.rc == 0
+    - patroni_venv_version.stdout | trim != patroni_python_version.stdout | trim
+  block:
+    # Deleting the venv under a running Patroni is unsafe → do it as a maintenance task
+    - name: Stop when Patroni is running from the old virtualenv
+      ansible.builtin.fail:
+        msg: >-
+          {{ patroni_venv }} uses Python {{ patroni_venv_version.stdout | trim }} but patroni_python
+          ({{ patroni_python }}) is {{ patroni_python_version.stdout | trim }}. Rebuild during maintenance:
+          `pctl pause --wait`, then on each node `sudo systemctl stop patroni && sudo rm -rf {{ patroni_venv }}`,
+          re-run `ansible-playbook site.yml --tags patroni`, then `pctl resume --wait`.
+      when: patroni_was_active | bool
+
+    - name: Remove the stale virtualenv (Patroni is stopped)
+      ansible.builtin.file:
+        path: "{{ patroni_venv }}"
+        state: absent
+
+- name: Install Patroni into virtualenv {{ patroni_version }}
+  ansible.builtin.pip:
+    name:
+      - "patroni[etcd3]=={{ patroni_version }}"
+      - "psycopg[binary]=={{ psycopg_version }}"
+    virtualenv: "{{ patroni_venv }}"
+    virtualenv_command: "{{ patroni_python }} -m venv"
+    extra_args: "{{ patroni_pip_extra_args | default(omit, true) }}"
+  register: patroni_pip
+
+- name: Link patroni / patronictl into /usr/local/bin
+  ansible.builtin.file:
+    src: "{{ patroni_venv }}/bin/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+  loop: [patroni, patronictl]
+
+- name: Create Patroni config directory
+  ansible.builtin.file:
+    path: "{{ patroni_config_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+- name: Write Patroni config
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: "{{ patroni_config_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+    # --validate-config also tries to bind the ports, so it only works while Patroni is not running
+    validate: "{{ (patroni_venv ~ '/bin/patroni --validate-config %s') if not patroni_was_active | bool else omit }}"
+  notify: Reload patroni
+
+- name: Keep /etc/patroni.yml path from the original guide
+  ansible.builtin.file:
+    src: "{{ patroni_config_file }}"
+    dest: /etc/patroni.yml
+    state: link
+
+- name: Shell helpers (PATRONICTL_CONFIG_FILE + pctl alias)
+  ansible.builtin.copy:
+    dest: /etc/profile.d/patroni.sh
+    mode: "0644"
+    content: |
+      # {{ ansible_managed }}
+      export PATRONICTL_CONFIG_FILE={{ patroni_config_file }}
+      # pctl list | pctl history | pctl show-config | pctl switchover ...
+      alias pctl='sudo {{ patroni_venv }}/bin/patronictl -c {{ patroni_config_file }}'
+
+- name: Write Patroni systemd unit
+  ansible.builtin.template:
+    src: patroni.service.j2
+    dest: /etc/systemd/system/patroni.service
+    mode: "0644"
+  register: patroni_unit
+
+# Apply new config (e.g. pg_hba) to running members right away, before waiting for replicas;
+# otherwise replicas wait for a pg_hba that has not been reloaded yet until they time out
+- name: Apply Patroni config changes now (reload running members)
+  ansible.builtin.meta: flush_handlers
+
+# ---- Start the bootstrap node first, then wait for a Leader ----
+- name: Start Patroni on bootstrap node
+  ansible.builtin.systemd_service:
+    name: patroni
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: inventory_hostname == patroni_bootstrap_node
+
+- name: Wait until the cluster has a leader
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[patroni_bootstrap_node]['node_ip'] }}:{{ patroni_restapi_port }}/cluster"
+    return_content: true
+  register: patroni_cluster
+  until: >-
+    patroni_cluster.json is defined and
+    (patroni_cluster.json.members | default([]) | selectattr('role', 'equalto', 'leader') | list | length) > 0
+  retries: "{{ patroni_bootstrap_wait_retries }}"
+  delay: 5
+  run_once: true
+
+# ---- Start replicas one at a time (cloned from the leader with pg_basebackup) ----
+- name: Start Patroni on replica nodes (one at a time)
+  ansible.builtin.systemd_service:
+    name: patroni
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: inventory_hostname != patroni_bootstrap_node
+  throttle: 1
+
+- name: Wait until every member reports healthy
+  ansible.builtin.uri:
+    url: "http://{{ node_ip }}:{{ patroni_restapi_port }}/health"
+    status_code: 200
+  register: patroni_health
+  until: patroni_health.status == 200
+  retries: "{{ patroni_replica_wait_retries }}"
+  delay: 10
+
+# ---- Patroni upgrade / unit change on an already running cluster ----
+# Stopping Patroni normally stops PostgreSQL too (and the leader fails over),
+# so pause the cluster, restart Patroni, then resume
+- name: Rolling restart of Patroni daemons (maintenance mode)
+  when:
+    - patroni_was_active | bool
+    - patroni_pip is changed or patroni_unit is changed
+  block:
+    - name: Pause cluster management
+      ansible.builtin.command: "{{ patroni_venv }}/bin/patronictl -c {{ patroni_config_file }} pause --wait"
+      run_once: true
+      changed_when: true
+
+    - name: Restart Patroni daemon
+      ansible.builtin.systemd_service:
+        name: patroni
+        state: restarted
+        daemon_reload: true
+      throttle: 1
+
+    - name: Resume cluster management
+      ansible.builtin.command: "{{ patroni_venv }}/bin/patronictl -c {{ patroni_config_file }} resume --wait"
+      run_once: true
+      changed_when: true

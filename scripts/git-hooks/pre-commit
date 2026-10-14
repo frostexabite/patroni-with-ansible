@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Block commits of vault files that are not encrypted
+# Enable with:  git config core.hooksPath scripts/git-hooks
+set -euo pipefail
+
+status=0
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  if ! head -n1 "$f" | grep -q '^\$ANSIBLE_VAULT;'; then
+    echo "ERROR: $f is not encrypted. Run: ansible-vault encrypt $f" >&2
+    status=1
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACM | grep -E '(^|/)vault\.ya?ml$' || true)
+
+exit $status

@@ -1,0 +1,49 @@
+# {{ ansible_managed }}
+# HAProxy asks the Patroni REST API (port {{ patroni_restapi_port }}) which node is primary/replica
+#   /primary -> 200 only on the leader       (replaces the deprecated /master)
+#   /replica -> 200 only on a streaming replica
+global
+    log stdout format raw local0
+    maxconn {{ haproxy_maxconn }}
+    user haproxy
+    group haproxy
+    stats socket /var/lib/haproxy/stats mode 660 level admin
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    retries 2
+    timeout client 30m
+    timeout connect 4s
+    timeout server 30m
+    timeout check 5s
+
+listen stats
+    mode http
+    bind *:{{ haproxy_stats_port }}
+    stats enable
+    stats uri /
+    stats refresh 10s
+    stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+
+listen postgres_write
+    bind *:{{ haproxy_write_port }}
+    option httpchk
+    http-check send meth GET uri /primary
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+{% for h in groups['pg_cluster'] %}
+    server {{ h }} {{ hostvars[h]['node_ip'] }}:{{ pg_port }} maxconn {{ haproxy_backend_maxconn }} check port {{ patroni_restapi_port }}
+{% endfor %}
+
+listen postgres_read
+    bind *:{{ haproxy_read_port }}
+    balance roundrobin
+    option httpchk
+    http-check send meth GET uri {{ haproxy_read_check_uri }}
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+{% for h in groups['pg_cluster'] %}
+    server {{ h }} {{ hostvars[h]['node_ip'] }}:{{ pg_port }} maxconn {{ haproxy_backend_maxconn }} check port {{ patroni_restapi_port }}
+{% endfor %}

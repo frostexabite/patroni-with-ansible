@@ -1,0 +1,7 @@
+---
+profile: production
+exclude_paths:
+  - collections/
+  - .git/
+skip_list:
+  - var-naming[no-role-prefix]   # variables are shared by several roles through group_vars
